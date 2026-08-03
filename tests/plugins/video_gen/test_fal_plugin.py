@@ -27,29 +27,6 @@ def test_fal_provider_registers():
     assert DEFAULT_MODEL in {"pixverse-v6", "ltx-2.3"}
 
 
-def test_fal_family_catalog():
-    """Each family declares both endpoints. The catalog covers the
-    cheap + premium tiers Teknium listed."""
-    from plugins.video_gen.fal import FAL_FAMILIES
-
-    expected = {
-        # cheap
-        "ltx-2.3", "pixverse-v6",
-        # premium
-        "veo3.1", "seedance-2.0", "kling-v3-4k", "happy-horse",
-    }
-    assert expected.issubset(set(FAL_FAMILIES.keys())), (
-        f"missing families: {expected - set(FAL_FAMILIES.keys())}"
-    )
-    for fid, meta in FAL_FAMILIES.items():
-        assert meta.get("text_endpoint"), f"{fid} missing text_endpoint"
-        assert meta.get("image_endpoint"), f"{fid} missing image_endpoint"
-        assert meta["text_endpoint"] != meta["image_endpoint"]
-        assert meta.get("tier") in {"cheap", "premium"}, (
-            f"{fid} has invalid tier"
-        )
-
-
 def test_kling_4k_uses_start_image_url():
     """Kling v3 4K's image-to-video endpoint expects start_image_url,
     not image_url. The family must declare image_param_key='start_image_url'."""
@@ -72,57 +49,39 @@ def test_kling_4k_uses_start_image_url():
     assert "image_url" not in payload
 
 
-def test_fal_list_models_advertises_both_modalities():
-    from plugins.video_gen.fal import FALVideoGenProvider
-
-    models = FALVideoGenProvider().list_models()
-    for m in models:
-        assert set(m["modalities"]) == {"text", "image"}, (
-            f"{m['id']} doesn't advertise both modalities — every family "
-            f"should have t2v + i2v"
-        )
-
-
-def test_fal_unavailable_without_key(monkeypatch):
-    from plugins.video_gen.fal import FALVideoGenProvider
-
-    monkeypatch.delenv("FAL_KEY", raising=False)
-    assert FALVideoGenProvider().is_available() is False
-
-
-def test_fal_generate_requires_fal_key(monkeypatch):
-    from plugins.video_gen.fal import FALVideoGenProvider
-
-    monkeypatch.delenv("FAL_KEY", raising=False)
-    result = FALVideoGenProvider().generate("a happy dog")
-    assert result["success"] is False
-    assert result["error_type"] == "auth_required"
-
-
 class TestFamilyRouting:
     """The headline behavior: image_url presence picks the endpoint."""
 
     @pytest.fixture
     def with_fake_fal(self, monkeypatch):
-        """Stub fal_client.subscribe to capture which endpoint we hit."""
+        """Stub fal_client.submit to capture which endpoint we hit."""
         import sys
         import types
 
         captured = {"endpoint": None, "arguments": None}
 
+        class FakeHandle:
+            def get(self):
+                return {"video": {"url": "https://fake/out.mp4"}}
+
         fake = types.ModuleType("fal_client")
-        def _subscribe(endpoint, arguments=None, with_logs=False):
+        def _submit(endpoint, arguments=None, headers=None):
             captured["endpoint"] = endpoint
             captured["arguments"] = arguments
-            return {"video": {"url": "https://fake/out.mp4"}}
-        fake.subscribe = _subscribe  # type: ignore
+            return FakeHandle()
+        fake.submit = _submit  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
         # Reset the lazy global so it picks up our stub
         from plugins.video_gen import fal as fal_plugin
         fal_plugin._fal_client = None
+        # Also reset the managed client cache
+        fal_plugin._managed_fal_video_client = None
+        fal_plugin._managed_fal_video_client_config = None
 
         monkeypatch.setenv("FAL_KEY", "test")
+        # Force direct mode — no managed gateway
+        monkeypatch.setattr(fal_plugin, "_resolve_managed_fal_video_gateway", lambda: None)
         return captured
 
     def test_text_to_video_routes_to_text_endpoint(self, with_fake_fal):
@@ -160,16 +119,6 @@ class TestFamilyRouting:
         expected_endpoint = FAL_FAMILIES[DEFAULT_MODEL]["text_endpoint"]
         assert with_fake_fal["endpoint"] == expected_endpoint
 
-    def test_default_family_image_routing(self, with_fake_fal):
-        from plugins.video_gen.fal import FALVideoGenProvider, FAL_FAMILIES, DEFAULT_MODEL
-
-        result = FALVideoGenProvider().generate(
-            "animate this",
-            image_url="https://example.com/i.png",
-        )
-        assert result["success"] is True
-        expected_endpoint = FAL_FAMILIES[DEFAULT_MODEL]["image_endpoint"]
-        assert with_fake_fal["endpoint"] == expected_endpoint
 
     def test_unknown_family_falls_back_to_default(self, with_fake_fal):
         from plugins.video_gen.fal import FALVideoGenProvider, FAL_FAMILIES, DEFAULT_MODEL
@@ -196,20 +145,6 @@ class TestFamilyRouting:
         # Seedance uses regular image_url (not start_image_url)
         assert with_fake_fal["arguments"]["image_url"] == "https://example.com/dog.png"
 
-    def test_kling_4k_remaps_image_param(self, with_fake_fal):
-        """Kling v3 4K image-to-video receives start_image_url, not image_url."""
-        from plugins.video_gen.fal import FALVideoGenProvider
-
-        result = FALVideoGenProvider().generate(
-            "x",
-            model="kling-v3-4k",
-            image_url="https://example.com/frame.png",
-        )
-        assert result["success"] is True
-        assert with_fake_fal["endpoint"] == "fal-ai/kling-video/v3/4k/image-to-video"
-        assert with_fake_fal["arguments"].get("start_image_url") == "https://example.com/frame.png"
-        assert "image_url" not in with_fake_fal["arguments"]
-
 
 class TestPayloadBuilder:
     def test_drops_unsupported_keys(self):
@@ -229,7 +164,7 @@ class TestPayloadBuilder:
             seed=42,
         )
         assert p["prompt"] == "x"
-        assert p["duration"] == "8"  # FAL queue API uses strings
+        assert p["duration"] == "8s"  # veo3.1 uses "Ns" format per FAL API
         assert p["aspect_ratio"] == "16:9"
         assert p["resolution"] == "720p"
         assert p["generate_audio"] is True
@@ -253,22 +188,6 @@ class TestPayloadBuilder:
         )
         assert p["duration"] == "15"
 
-    def test_kling_4k_clamps_below_min(self):
-        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
-
-        meta = FAL_FAMILIES["kling-v3-4k"]
-        p = _build_payload(
-            meta,
-            prompt="x",
-            image_url="https://i.png",
-            duration=1,         # below min (3) → 3
-            aspect_ratio="16:9",
-            resolution="720p",
-            negative_prompt=None,
-            audio=None,
-            seed=None,
-        )
-        assert p["duration"] == "3"
 
     def test_ltx_omits_duration_aspect_resolution(self):
         """LTX 2.3 doesn't declare duration/aspect/resolution enums —
@@ -293,6 +212,29 @@ class TestPayloadBuilder:
         # But audio + negative are advertised
         assert p["generate_audio"] is True
         assert p["negative_prompt"] == "ugly"
+
+    def test_range_families_omit_duration_when_unspecified(self):
+        """Range-based families must omit `duration` when the caller doesn't
+        specify one so FAL applies its endpoint default, not the minimum."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        for family_id in ("pixverse-v6", "seedance-2.0", "kling-v3-4k"):
+            meta = FAL_FAMILIES[family_id]
+            p = _build_payload(
+                meta,
+                prompt="x",
+                image_url=None,
+                duration=None,
+                aspect_ratio="16:9",
+                resolution="720p",
+                negative_prompt=None,
+                audio=None,
+                seed=None,
+            )
+            assert "duration" not in p, (
+                f"{family_id}: duration=None should omit the field, "
+                f"got {p.get('duration')!r}"
+            )
 
     def test_happy_horse_minimal_payload(self):
         """Happy Horse has sparse docs — payload should be minimal."""

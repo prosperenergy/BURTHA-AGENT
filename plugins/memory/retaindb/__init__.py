@@ -34,6 +34,8 @@ from typing import Any, Dict, List
 from urllib.parse import quote
 
 from agent.memory_provider import MemoryProvider
+from agent.secret_scope import get_secret
+from agent.file_safety import raise_if_read_blocked
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -475,7 +477,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         return "retaindb"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("RETAINDB_API_KEY"))
+        return bool(get_secret("RETAINDB_API_KEY"))
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -487,7 +489,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        api_key = os.environ.get("RETAINDB_API_KEY", "")
+        api_key = get_secret("RETAINDB_API_KEY", "") or ""
         base_url = re.sub(r"/+$", "", os.environ.get("RETAINDB_BASE_URL", _DEFAULT_BASE_URL))
 
         # Project resolution: RETAINDB_PROJECT > hermes-<profile> > "default"
@@ -702,6 +704,10 @@ class RetainDBMemoryProvider(MemoryProvider):
             path_obj = Path(local_path)
             if not path_obj.exists():
                 return {"error": f"File not found: {local_path}"}
+            try:
+                raise_if_read_blocked(str(path_obj))
+            except ValueError as exc:
+                return {"error": str(exc)}
             data = path_obj.read_bytes()
             import mimetypes
             mime = mimetypes.guess_type(path_obj.name)[0] or "application/octet-stream"

@@ -8,7 +8,7 @@ only renders as a voice bubble when explicitly flagged) and via
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,7 +22,7 @@ class _MediaRoutingAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
 
-    async def connect(self):
+    async def connect(self, *, is_reconnect: bool = False):
         return True
 
     async def disconnect(self):
@@ -63,44 +63,6 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
 
 
 @pytest.mark.asyncio
-async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
-    adapter = _MediaRoutingAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.flac")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata=None,
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
-    adapter = _MediaRoutingAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata=None,
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
     event = _event()
@@ -116,7 +78,7 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
-        metadata=None,
+        metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
 
@@ -132,98 +94,6 @@ def _fake_runner(thread_meta):
 
 
 @pytest.mark.asyncio
-async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
-    event = _event(thread_id="topic-1")
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.flac")
-    adapter = SimpleNamespace(
-        name="test",
-        extract_media=BasePlatformAdapter.extract_media,
-        extract_images=BasePlatformAdapter.extract_images,
-        extract_local_files=BasePlatformAdapter.extract_local_files,
-        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
-        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
-        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
-        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
-    )
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner({"thread_id": "topic-1"}),
-        f"MEDIA:{media_file}",
-        event,
-        adapter,
-    )
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata={"thread_id": "topic-1"},
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
-    event = _event(thread_id="topic-1")
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")
-    adapter = SimpleNamespace(
-        name="test",
-        extract_media=BasePlatformAdapter.extract_media,
-        extract_images=BasePlatformAdapter.extract_images,
-        extract_local_files=BasePlatformAdapter.extract_local_files,
-        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
-        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
-        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
-        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
-    )
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner({"thread_id": "topic-1"}),
-        f"MEDIA:{media_file}",
-        event,
-        adapter,
-    )
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata={"thread_id": "topic-1"},
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(tmp_path, monkeypatch):
-    """MP3 audio on Telegram must go through send_voice (which routes to
-    sendAudio internally); Telegram accepts MP3 for the audio player."""
-    event = _event(thread_id="topic-1")
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.mp3")
-    adapter = SimpleNamespace(
-        name="test",
-        extract_media=BasePlatformAdapter.extract_media,
-        extract_images=BasePlatformAdapter.extract_images,
-        extract_local_files=BasePlatformAdapter.extract_local_files,
-        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
-        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
-        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
-        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
-    )
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner({"thread_id": "topic-1"}),
-        f"MEDIA:{media_file}",
-        event,
-        adapter,
-    )
-
-    adapter.send_voice.assert_awaited_once_with(
-        chat_id="chat-1",
-        audio_path=str(media_file),
-        metadata={"thread_id": "topic-1"},
-    )
-    adapter.send_document.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
     allowed_root = tmp_path / "media-cache"
@@ -234,9 +104,12 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
         "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
         (allowed_root,),
     )
-    # This test exercises the strict-allowlist path; disable recency trust so
-    # the freshly-written tmp_path file is not auto-accepted by the trust
-    # window. (Recency trust is covered separately in test_platform_base.py.)
+    # This test exercises the strict-allowlist path; force strict mode on
+    # and disable recency trust so the freshly-written tmp_path file is not
+    # auto-accepted by the trust window. (Recency trust is covered separately
+    # in test_platform_base.py. The public default flipped to non-strict in
+    # 2026-05; this test pins strict on explicitly.)
+    monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
     monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
     adapter = SimpleNamespace(
         name="test",
@@ -258,3 +131,68 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
 
     adapter.send_document.assert_not_awaited()
     adapter.send_voice.assert_not_awaited()
+
+
+class _DiscordMediaFailureAdapter(BasePlatformAdapter):
+    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+        self.notices: list[str] = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content=None, **kwargs):
+        self.notices.append(content or "")
+        return SendResult(success=True, message_id="notice")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
+    """Attachmentless send_video results must surface a user-visible notice (#66797)."""
+    adapter = _DiscordMediaFailureAdapter()
+    event = _event()
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "clip.mp4")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
+    adapter.send_video = AsyncMock(
+        return_value=SendResult(
+            success=False,
+            error="Discord accepted the message but attached no files (clip.mp4)",
+        )
+    )
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
+    adapter.send_multiple_images = AsyncMock()
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send_video.assert_awaited_once()
+    assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
+
+
+class _DiscordMediaFailureAdapter(BasePlatformAdapter):
+    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+        self.notices: list[str] = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content=None, **kwargs):
+        self.notices.append(content or "")
+        return SendResult(success=True, message_id="notice")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}

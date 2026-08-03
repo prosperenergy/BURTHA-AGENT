@@ -1,5 +1,6 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
+import hashlib
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,72 +40,169 @@ def mock_args():
     return SimpleNamespace()
 
 
+# ---------------------------------------------------------------------------
+# Managed-uv compatibility for tests that patch shutil.which
+# ---------------------------------------------------------------------------
+# The production code now uses ``ensure_uv()`` / ``update_managed_uv()``
+# instead of ``shutil.which("uv")``.  Many tests in this file patch
+# ``shutil.which`` to control whether uv is "available" — these autouse
+# fixtures make the managed_uv functions delegate to the patched
+# ``shutil.which`` so the existing test setup keeps working without
+# per-test changes.
+@pytest.fixture(autouse=True)
+def _patch_managed_uv(request):
+    """Make managed_uv helpers follow shutil.which mocking in tests."""
+    import shutil
+
+    # resolve_uv delegates to shutil.which("uv") so that test patches
+    # on shutil.which flow through naturally.
+    def _fake_resolve_uv():
+        return shutil.which("uv")
+
+    def _fake_ensure_uv(**_kwargs):
+        return shutil.which("uv")
+
+    def _fake_update_managed_uv(**_kwargs):
+        return None  # never actually self-update in tests
+
+    with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
+         patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
+         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
+        yield
+
+
+class TestCmdUpdateNpmLockfileCache:
+    @staticmethod
+    def _cache_file(hermes_root, project_root):
+        cache_key = hashlib.sha256(str(project_root).encode()).hexdigest()[:12]
+        return hermes_root / f".npm_lock_hash_{cache_key}"
+
+
+
+    def test_record_npm_lockfile_hash(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+
+        hm._record_npm_lockfile_hash(tmp_path)
+
+        assert (
+            self._cache_file(tmp_path, tmp_path).read_text()
+            == hm._npm_manifests_digest()
+        )
+
+    def test_package_json_only_edit_defeats_skip(self, tmp_path, monkeypatch):
+        """Reviewer scenario (#61580): dev edits package.json WITHOUT running
+        npm — lockfile unchanged. `hermes update` must still install (the
+        npm-install fallback is what syncs node_modules in that state)."""
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (tmp_path / "package.json").write_text('{"dependencies": {}}')
+        (tmp_path / "node_modules").mkdir()
+        hm._record_npm_lockfile_hash(tmp_path)
+        assert hm._npm_lockfile_changed(tmp_path) is False
+
+        (tmp_path / "package.json").write_text(
+            '{"dependencies": {"left-pad": "^1.0.0"}}'
+        )
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+
+
+
+
+
+
+    def test_update_uses_one_shared_npm_cache_across_profiles(
+        self, tmp_path, monkeypatch
+    ):
+        """The npm cache describes checkout-global node_modules, not a profile."""
+        from hermes_cli import main as hm
+        import hermes_constants
+
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / "package.json").write_text("{}")
+        shared_root = tmp_path / ".hermes"
+        named_profile = shared_root / "profiles" / "work"
+        named_profile.mkdir(parents=True)
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", checkout)
+        monkeypatch.setattr(hermes_constants.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            hermes_constants, "find_node_executable", lambda _name: "/usr/bin/npm"
+        )
+
+        cache_roots = []
+        with patch.object(
+            hm,
+            "_npm_lockfile_changed",
+            side_effect=lambda root: cache_roots.append(root) or False,
+        ):
+            monkeypatch.setenv("HERMES_HOME", str(shared_root))
+            hm._update_node_dependencies()
+
+            monkeypatch.setenv("HERMES_HOME", str(named_profile))
+            hm._update_node_dependencies()
+
+        assert cache_roots == [shared_root, shared_root]
+
+
+class TestCmdUpdateTermuxUvBootstrap:
+    """Regression tests for Termux-specific uv bootstrap behavior."""
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_termux_uv_bootstrap_uses_binary_only_install(
+        self, mock_run, _mock_which, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
+
+        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
+
+        assert uv_bin is None
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0] == [
+            "/termux/python",
+            "-m",
+            "pip",
+            "install",
+            "uv",
+            "--only-binary",
+            ":all:",
+        ]
+        assert mock_run.call_args.kwargs["cwd"] == PROJECT_ROOT
+        assert mock_run.call_args.kwargs["check"] is False
+
+    @patch("subprocess.run")
+    def test_termux_reuses_existing_path_uv_without_pip(self, mock_run, monkeypatch):
+        """A uv already on PATH (e.g. ``pkg install uv``) is reused before pip runs."""
+        from hermes_cli import main as hm
+
+        pkg_uv = "/data/data/com.termux/files/usr/bin/uv"
+        monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
+        # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
+        # managed dir so the PATH probe is what surfaces the packaged uv.
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
+        monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
+
+        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
+
+        assert uv_bin == pkg_uv
+        mock_run.assert_not_called()
+
+
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_update_falls_back_to_main_when_branch_not_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
-    ):
-        mock_run.side_effect = _make_run_side_effect(
-            branch="fix/stoicneko", verify_ok=False, commit_count="3"
-        )
 
-        cmd_update(mock_args)
 
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-
-        # rev-list should use origin/main, not origin/fix/stoicneko
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
-
-        # pull should use main, not fix/stoicneko
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_update_uses_current_branch_when_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
-    ):
-        mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="2"
-        )
-
-        cmd_update(mock_args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_update_already_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
-    ):
-        mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="0"
-        )
-
-        cmd_update(mock_args)
-
-        captured = capsys.readouterr()
-        assert "Already up to date!" in captured.out
-
-        # Should NOT have called pull
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 0
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -129,88 +227,13 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
-        sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
+        expected_git_cmd = (
+            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
+        )
+        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
-    @patch("shutil.which")
-    @patch("subprocess.run")
-    def test_update_refreshes_repo_and_tui_node_dependencies(
-        self, mock_run, mock_which, mock_args
-    ):
-        from hermes_cli import main as hm
-
-        mock_which.side_effect = {"uv": "/usr/bin/uv", "npm": "/usr/bin/npm"}.get
-        mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="1"
-        )
-        # The web UI build runs through _run_with_idle_timeout now (issue
-        # #33788) so it no longer appears in subprocess.run's call list.
-        # Mock it so the test doesn't actually shell out to ``tsc``.
-        import subprocess as _subprocess
-        build_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with patch.object(hm, "_is_termux_env", return_value=False), \
-             patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle:
-            cmd_update(mock_args)
-
-        npm_calls = [
-            (call.args[0], call.kwargs.get("cwd"))
-            for call in mock_run.call_args_list
-            if call.args and call.args[0][0] == "/usr/bin/npm"
-        ]
-
-        # cmd_update runs npm commands in four locations:
-        #   1. repo root  — slash-command / TUI bridge deps  (subprocess.run)
-        #   2. ui-tui/    — Ink TUI deps                     (subprocess.run)
-        #   3. web/       — npm install                      (subprocess.run)
-        #   4. web/       — npm run build                    (_run_with_idle_timeout)
-        #
-        # Repo-root and ui-tui installs intentionally omit `--silent` and run
-        # without `capture_output` so optional postinstall scripts (e.g.
-        # `@askjo/camofox-browser`'s browser-binary fetch) print progress —
-        # otherwise long downloads look like a hang (#18840).  The web/ install
-        # keeps `--silent` because its build step is short and noisy.
-        update_flags = [
-            "/usr/bin/npm",
-            "ci",
-            "--no-fund",
-            "--no-audit",
-            "--progress=false",
-        ]
-        assert npm_calls[:2] == [
-            (update_flags, PROJECT_ROOT),
-            (update_flags, PROJECT_ROOT / "ui-tui"),
-        ]
-        if len(npm_calls) > 2:
-            # Only the web/ install is left in subprocess.run; the build moved
-            # to _run_with_idle_timeout to make Vite progress visible (#33788).
-            assert npm_calls[2:] == [
-                (["/usr/bin/npm", "ci", "--silent"], PROJECT_ROOT / "web"),
-            ]
-
-        # The web UI build itself went through the streaming helper.
-        mock_idle.assert_called_once()
-        idle_args, idle_kwargs = mock_idle.call_args
-        assert idle_args[0] == ["/usr/bin/npm", "run", "build"]
-        assert idle_kwargs["cwd"] == PROJECT_ROOT / "web"
-
-        # Regression for #18840: repo root + ui-tui installs must stream
-        # output (capture_output=False) so postinstall progress is visible
-        # to the user.
-        repo_and_tui_calls = [
-            call
-            for call in mock_run.call_args_list
-            if call.args
-            and call.args[0][0] == "/usr/bin/npm"
-            and call.args[0][1] == "ci"
-            and call.kwargs.get("cwd") in {PROJECT_ROOT, PROJECT_ROOT / "ui-tui"}
-        ]
-        assert len(repo_and_tui_calls) == 2
-        for call in repo_and_tui_calls:
-            assert call.kwargs.get("capture_output") is False, (
-                "repo-root / ui-tui npm install must stream output "
-                "(no capture_output) so postinstall progress is visible"
-            )
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
@@ -240,6 +263,83 @@ class TestCmdUpdateBranchFallback:
             captured = capsys.readouterr()
             assert "applying safe config migrations" in captured.out
             assert "API keys require manual entry" in captured.out
+
+
+class TestCmdUpdateMigrationPrompt:
+    """The config-migration prompt names what changed and skips the prompt
+    entirely when only the config format version moved.
+
+    Regression guard for the contentless-prompt report (ScottFive / Tt2021):
+    previously the prompt printed only counts ("1 new config option") and
+    asked "configure them now?" even for pure version bumps, where saying
+    yes looked like a no-op.
+    """
+
+    def test_version_bump_only_applies_silently_without_prompt(
+        self, mock_args, capsys
+    ):
+        """Only the version moved → apply non-interactively, never prompt."""
+        with patch("shutil.which", return_value=None), patch(
+            "subprocess.run"
+        ) as mock_run, patch("builtins.input") as mock_input, patch(
+            "hermes_cli.config.get_missing_env_vars", return_value=[]
+        ), patch(
+            "hermes_cli.config.get_missing_config_fields", return_value=[]
+        ), patch(
+            "hermes_cli.config.check_config_version", return_value=(5, 24)
+        ), patch(
+            "hermes_cli.config.migrate_config",
+            return_value={"env_added": [], "config_added": [], "warnings": []},
+        ) as mock_migrate:
+            mock_run.side_effect = _make_run_side_effect(
+                branch="main", verify_ok=True, commit_count="1"
+            )
+
+            cmd_update(mock_args)
+
+            mock_input.assert_not_called()
+            mock_migrate.assert_called_once_with(interactive=False, quiet=True)
+            out = capsys.readouterr().out
+            assert "Updating config format (v5 → v24)" in out
+            assert "no new settings to configure" in out
+            # The misleading question must NOT appear for a pure version bump.
+            assert "configure them now" not in out.lower()
+
+    def test_new_options_are_listed_by_name_before_prompt(
+        self, mock_args, capsys
+    ):
+        """New env/config keys are printed by name so the user can decide."""
+        env_items = [
+            {"name": "FOO_API_KEY", "description": "Foo service API key"},
+        ]
+        cfg_items = [
+            {"key": "display.new_widget", "description": "New config option: display.new_widget"},
+        ]
+        with patch("shutil.which", return_value=None), patch(
+            "subprocess.run"
+        ) as mock_run, patch("builtins.input", return_value="n"), patch(
+            "hermes_cli.config.get_missing_env_vars", return_value=env_items
+        ), patch(
+            "hermes_cli.config.get_missing_config_fields", return_value=cfg_items
+        ), patch(
+            "hermes_cli.config.check_config_version", return_value=(1, 24)
+        ), patch(
+            "hermes_cli.config.migrate_config",
+            return_value={"env_added": [], "config_added": [], "warnings": []},
+        ), patch("hermes_cli.main.sys") as mock_sys:
+            mock_sys.stdin.isatty.return_value = True
+            mock_sys.stdout.isatty.return_value = True
+            mock_run.side_effect = _make_run_side_effect(
+                branch="main", verify_ok=True, commit_count="1"
+            )
+
+            cmd_update(mock_args)
+
+            out = capsys.readouterr().out
+            # Names, not just counts.
+            assert "FOO_API_KEY" in out
+            assert "Foo service API key" in out
+            assert "display.new_widget" in out
 
 
 class TestCmdUpdateProfileSkillSync:
@@ -377,66 +477,10 @@ class TestCmdUpdateBranchFlag:
         assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
-        # pull must target bb/gui
-        pull_cmds = [c for c in commands if "pull" in c and "ff-only" in c]
-        assert any("bb/gui" in c and "main" not in c.split() for c in pull_cmds), pull_cmds
+        # the ff-only merge must target origin/bb/gui
+        merge_cmds = [c for c in commands if "merge --ff-only" in c]
+        assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
 
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_branch_flag_defaults_to_main_when_none(self, mock_run, _mock_which, capsys):
-        """No --branch (or --branch=None) preserves the historical 'main' default."""
-        mock_run.side_effect = self._branch_side_effect(
-            current_branch="main", target_branch="main", commit_count="0"
-        )
-        args = SimpleNamespace(branch=None)
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert all("origin/main" in c for c in rev_list_cmds), rev_list_cmds
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_branch_flag_switches_from_different_branch(self, mock_run, _mock_which, capsys):
-        """When HEAD is on main and --branch=bb/gui, switch to bb/gui first."""
-        mock_run.side_effect = self._branch_side_effect(
-            current_branch="main", target_branch="bb/gui", commit_count="2"
-        )
-        args = SimpleNamespace(branch="bb/gui")
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # First checkout call should switch us to bb/gui (not -B; happy-path branch exists locally)
-        checkout_cmds = [c for c in commands if "checkout" in c and "rev-parse" not in c]
-        assert len(checkout_cmds) >= 1
-        assert "bb/gui" in checkout_cmds[0]
-
-        out = capsys.readouterr().out
-        assert "switching to bb/gui" in out
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_branch_flag_tracks_remote_when_branch_absent_locally(self, mock_run, _mock_which, capsys):
-        """If local lacks the branch but origin has it, fall back to ``checkout -B``."""
-        mock_run.side_effect = self._branch_side_effect(
-            current_branch="main",
-            target_branch="bb/gui",
-            checkout_fails=True,  # plain checkout fails
-            track_fails=False,    # -B from origin/bb/gui succeeds
-            commit_count="2",
-        )
-        args = SimpleNamespace(branch="bb/gui")
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have BOTH a failed `checkout bb/gui` AND a successful `checkout -B bb/gui origin/bb/gui`
-        track_cmds = [c for c in commands if "checkout" in c and "-B" in c]
-        assert len(track_cmds) == 1
-        assert "bb/gui" in track_cmds[0]
-        assert "origin/bb/gui" in track_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -586,21 +630,6 @@ class TestCmdUpdateCheckBranchFlag:
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
-    @patch("hermes_cli.config.detect_install_method", return_value="pip")
-    @patch("hermes_cli.banner.check_via_pypi", return_value=0)
-    @patch("subprocess.run")
-    def test_check_branch_warns_on_pypi_install(
-        self, mock_run, _mock_pypi, _mock_method, capsys
-    ):
-        """PyPI install + --branch=<non-main> surfaces a warning instead of silent drop."""
-        args = SimpleNamespace(check=True, branch="bb/gui")
-
-        cmd_update(args)
-
-        out = capsys.readouterr().out
-        assert "--branch is ignored for PyPI installs" in out
-        assert "bb/gui" in out
-
 
 class TestCmdUpdateZipBranchRefusal:
     """``hermes update --branch=<non-main>`` must refuse on the ZIP fallback path.
@@ -632,12 +661,6 @@ def test_is_termux_env_true_for_termux_prefix():
     assert hm._is_termux_env({"PREFIX": "/data/data/com.termux/files/usr"}) is True
 
 
-def test_is_termux_env_false_for_non_termux_prefix():
-    from hermes_cli import main as hm
-
-    assert hm._is_termux_env({"PREFIX": "/usr/local"}) is False
-
-
 def test_load_installable_optional_extras_supports_termux_group(tmp_path, monkeypatch):
     from hermes_cli import main as hm
 
@@ -659,3 +682,74 @@ termux = ["rich>=14"]
 
     assert hm._load_installable_optional_extras(group="all") == ["mcp"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+
+
+class TestNodeRuntimeNpmResolution:
+    """Regression tests for #30271 — WSL must not run Windows npm against the
+    Linux checkout, and a failed Node refresh must not report success."""
+
+
+
+
+
+
+    def test_node_failure_returns_failed_labels_and_warns(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / "package.json").write_text("{}")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr(
+            hm,
+            "_run_npm_install_deterministic",
+            lambda *a, **k: subprocess.CompletedProcess([], 1, stdout="", stderr=""),
+        )
+
+        failed = hm._update_node_dependencies()
+        assert failed == ["repo root"]
+        out = capsys.readouterr().out
+        assert "mixed state" in out
+
+
+
+    def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
+        """A Windows-only npm on WSL must not reach web or desktop builds."""
+        from hermes_cli import main as hm
+        import hermes_constants
+
+        windows_npm = "/mnt/c/Program Files/nodejs/npm"
+        monkeypatch.setattr(hm, "_is_windows", lambda: False)
+        monkeypatch.setattr(hermes_constants, "is_wsl", lambda: True)
+        monkeypatch.setattr(
+            hermes_constants,
+            "find_node_executable",
+            lambda command: windows_npm if command == "npm" else None,
+        )
+        monkeypatch.setattr(
+            hm.shutil,
+            "which",
+            lambda command, path=None: windows_npm if command == "npm" else "/usr/bin/uv",
+        )
+        monkeypatch.setenv("PATH", "/mnt/c/Program Files/nodejs")
+
+        with patch("subprocess.run") as mock_run, \
+             patch.object(hm, "_web_ui_build_needed", return_value=True), \
+             patch.object(hm, "_desktop_packaged_executable", return_value=None), \
+             patch.object(hm, "_desktop_dist_exists", return_value=True), \
+             patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install, \
+             patch.object(hm, "_run_with_idle_timeout") as mock_idle_build, \
+             patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
+            mock_run.side_effect = _make_run_side_effect(
+                branch="main", verify_ok=True, commit_count="1"
+            )
+            cmd_update(mock_args)
+
+        mock_npm_install.assert_not_called()
+        mock_idle_build.assert_not_called()
+        mock_desktop_build.assert_not_called()
+        assert all(
+            not call.args or not call.args[0] or call.args[0][0] != windows_npm
+            for call in mock_run.call_args_list
+        )

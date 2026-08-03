@@ -3,9 +3,11 @@ import { memo, useState } from 'react'
 
 import { TERMUX_TUI_MODE } from '../config/env.js'
 import { LONG_MSG } from '../config/limits.js'
+import { hasLeadGap } from '../domain/blockLayout.js'
 import { sectionMode } from '../domain/details.js'
 import { userDisplay } from '../domain/messages.js'
 import { ROLE } from '../domain/roles.js'
+import { splitSlashSkillRefs } from '../domain/slash.js'
 import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
 import {
   boundedLiveRenderText,
@@ -33,6 +35,7 @@ export const MessageLine = memo(function MessageLine({
   detailsModeCommandOverride = false,
   isStreaming = false,
   msg,
+  prev,
   sections,
   t,
   tools = []
@@ -48,6 +51,14 @@ export const MessageLine = memo(function MessageLine({
   const toolsMode = sectionMode('tools', detailsMode, sections, detailsModeCommandOverride)
   const activityMode = sectionMode('activity', detailsMode, sections, detailsModeCommandOverride)
   const thinking = msg.thinking?.trim() ?? ''
+
+  // One blank line above this block iff it opens a new visual group relative
+  // to the block directly above it (`prev`) — the flex-grouping rule. Applied
+  // intrinsically on each *rendered* element (not via an outer wrapper) so a
+  // block that renders nothing — e.g. a tool trail hidden by /details — emits
+  // no floating gap. Streaming-safe: the gap is derived from the stable
+  // predecessor, never this block's own live content. See domain/blockLayout.
+  const leadGap = hasLeadGap(prev, msg)
 
   // Collapse toggle for long system messages
   const systemIsLong = msg.role === 'system' && msg.text.length > SYSTEM_COLLAPSE_CHARS
@@ -65,12 +76,13 @@ export const MessageLine = memo(function MessageLine({
   }
 
   if (msg.kind === 'trail' && (msg.tools?.length || tools.length || thinking)) {
-    return thinkingMode !== 'hidden' || toolsMode !== 'hidden' || activityMode !== 'hidden' ? (
-      <Box flexDirection="column">
+    return shouldShowThinkingTrail(msg, thinkingMode, toolsMode, activityMode) ? (
+      <Box flexDirection="column" marginTop={leadGap ? 1 : 0}>
         <ToolTrail
           commandOverride={detailsModeCommandOverride}
           detailsMode={detailsMode}
           reasoning={thinking}
+          reasoningAlwaysVisible={msg.isMoaReference}
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
           t={t}
@@ -80,6 +92,14 @@ export const MessageLine = memo(function MessageLine({
         />
       </Box>
     ) : null
+  }
+
+  // A trail with no reasoning, tools, or todos to show (e.g. the finalDetails
+  // segment message.complete appends carrying only a token tally) has nothing
+  // to draw — render nothing instead of an empty gutter row. blockRenders()
+  // agrees, so it also stays transparent to grouping and never opens a gap.
+  if (msg.kind === 'trail') {
+    return null
   }
 
   if (msg.role === 'tool') {
@@ -99,6 +119,23 @@ export const MessageLine = memo(function MessageLine({
             {preview}
           </Text>
         )}
+      </Box>
+    )
+  }
+
+  // Timeline events (model switches, delegation completions) render as
+  // dim ◈ markers with no gutter — not as opaque user messages.
+  if (msg.kind === 'event') {
+    const eventGutterWidth = transcriptGutterWidth('system', t.brand.prompt)
+
+    return (
+      <Box marginBottom={1} marginTop={leadGap ? 1 : 0}>
+        <NoSelect flexShrink={0} fromLeftEdge width={eventGutterWidth}>
+          <Text> </Text>
+        </NoSelect>
+        <Text color={t.color.muted} dimColor>
+          ◈ {msg.text}
+        </Text>
       </Box>
     )
   }
@@ -168,11 +205,32 @@ export const MessageLine = memo(function MessageLine({
       )
     }
 
+    // A skill the user referenced mid-prose (`clean this up with /clean`)
+    // keeps the accent it wore as a completion in the composer, instead of
+    // flattening back into the body text.
+    if (msg.role === 'user') {
+      const segments = splitSlashSkillRefs(msg.text)
+
+      return (
+        <Text {...(body ? { color: body } : {})}>
+          {segments.map((segment, i) =>
+            segment.ref ? (
+              <Text color={t.color.accent} key={i}>
+                {segment.text}
+              </Text>
+            ) : (
+              segment.text
+            )
+          )}
+        </Text>
+      )
+    }
+
     return <Text {...(body ? { color: body } : {})}>{msg.text}</Text>
   })()
 
   // Diff segments (emitted by pushInlineDiffSegment between narration
-  // segments) need a blank line on both sides so the patch doesn't butt up
+  // segments) keep a blank line on both sides so the patch doesn't butt up
   // against the prose around it.
   const isDiffSegment = msg.kind === 'diff'
 
@@ -180,7 +238,7 @@ export const MessageLine = memo(function MessageLine({
     <Box
       flexDirection="column"
       marginBottom={msg.role === 'user' || isDiffSegment ? 1 : 0}
-      marginTop={msg.role === 'user' || msg.kind === 'slash' || isDiffSegment ? 1 : 0}
+      marginTop={msg.role === 'user' || msg.kind === 'slash' || isDiffSegment || leadGap ? 1 : 0}
     >
       {showDetails && (
         <Box flexDirection="column" marginBottom={1}>
@@ -224,6 +282,18 @@ export const MessageLine = memo(function MessageLine({
 export const shouldShowResponseSeparator = (msg: Msg, showDetails: boolean): boolean =>
   msg.role === 'assistant' && showDetails && /\S/.test(msg.text)
 
+// A MoA reference block (msg.isMoaReference) is the user-facing
+// mixture-of-agents process the user opted into, not private model
+// reasoning — it must stay visible even when every other trail section is
+// hidden (#64657).
+export const shouldShowThinkingTrail = (
+  msg: Msg,
+  thinkingMode: DetailsMode,
+  toolsMode: DetailsMode,
+  activityMode: DetailsMode
+): boolean =>
+  Boolean(msg.isMoaReference) || thinkingMode !== 'hidden' || toolsMode !== 'hidden' || activityMode !== 'hidden'
+
 interface MessageLineProps {
   cols: number
   compact?: boolean
@@ -231,6 +301,10 @@ interface MessageLineProps {
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
   msg: Msg
+  // The block rendered directly above this one. Drives the group-boundary
+  // lead gap (see domain/blockLayout.ts::hasLeadGap). Undefined at the top of
+  // the transcript or when spacing is irrelevant.
+  prev?: Msg
   sections?: SectionVisibility
   t: Theme
   tools?: ActiveTool[]
