@@ -2525,13 +2525,17 @@ def init_agent(
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)
-    _allow_lmstudio_explicit_below_floor = (
-        str(getattr(agent, "provider", "") or "").strip().lower() == "lmstudio"
+    # Local EXO and LM Studio runners can truthfully report a smaller context
+    # window than the global hosted-model floor.  Keep this opt-in: only an
+    # explicit positive model.context_length allows the local route through.
+    _allow_explicit_local_below_floor = (
+        str(getattr(agent, "provider", "") or "").strip().lower()
+        in {"exo", "lmstudio"}
         and isinstance(agent._config_context_length, int)
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_explicit_local_below_floor:
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "

@@ -1,0 +1,5 @@
+name: exo-provider
+kind: model-provider
+version: 1.0.0
+description: Prosper EXO local OpenAI-compatible endpoint
+author: Prosper Energy
