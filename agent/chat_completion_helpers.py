@@ -555,6 +555,14 @@ def should_use_direct_api_call(agent) -> bool:
     return getattr(agent, "platform", None) == "subagent"
 
 
+# How often an in-flight direct_api_call refreshes last_activity_ts.
+# Must stay well under the async-delegation idle stall threshold (450s) and
+# the sync heartbeat idle window so a healthy slow model wait is never
+# mistaken for a frozen child. Kept below the 30s monitor sweep interval so
+# progress tokens change every sample while the request is open.
+_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS = 15.0
+
+
 def direct_api_call(agent, api_kwargs: dict):
     """Run a non-streaming LLM call inline on the conversation thread.
 
@@ -565,11 +573,18 @@ def direct_api_call(agent, api_kwargs: dict):
     request runs in-flight normally, the per-request OpenAI client's own httpx
     timeout (provider ``request_timeout_seconds`` / ``HERMES_API_TIMEOUT``) bounds
     a genuinely hung provider — the same bound interactive calls already rely on.
+
+    While the inline request blocks, a lightweight activity heartbeat keeps
+    ``last_activity_ts`` advancing. Subagents use this path (non-streaming),
+    and without mid-call ticks the async stall monitor / sync heartbeat treat
+    a slow-but-healthy local model wait as "no progress" and interrupt around
+    450s — surfacing as ``Operation interrupted: waiting for model response``.
     """
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    activity_hb_stop = threading.Event()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -595,6 +610,23 @@ def direct_api_call(agent, api_kwargs: dict):
         agent._active_request_abort = _abort_active_request
         return client
 
+    def _activity_heartbeat() -> None:
+        # Do not put the API call itself on another worker thread — that is
+        # the nested-pool deadlock this path exists to avoid (#60203). This
+        # ticker only refreshes the activity clock.
+        while not activity_hb_stop.wait(_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS):
+            try:
+                agent._touch_activity("waiting for non-streaming API response")
+            except Exception:
+                pass
+
+    activity_hb = threading.Thread(
+        target=_activity_heartbeat,
+        name="direct-api-activity-hb",
+        daemon=True,
+    )
+    activity_hb.start()
+
     # Only a clean return may report the reuse reason (request_complete):
     # after an error or interrupt the wire client is really closed so the
     # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
@@ -614,6 +646,8 @@ def direct_api_call(agent, api_kwargs: dict):
         succeeded = True
         return response
     finally:
+        activity_hb_stop.set()
+        activity_hb.join(timeout=2.0)
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
@@ -1226,6 +1260,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
+            provider=getattr(agent, "provider", None),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1712,7 +1747,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            # Exponential backoff: keep upstream's 60s first-hit cooldown and
+            # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
+            # 4h cap. The first 429 must NOT bench the primary for half an
+            # hour — fast primary restore is the common case; escalation only
+            # punishes providers that keep 429ing.
+            # Counter is reset by restore_primary_runtime on successful restore.
+            backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+            agent._rate_limit_backoff_count = backoff_count + 1
+            backoff_seconds = min(60 * (2 ** backoff_count), 14400)
+            agent._rate_limited_until = time.monotonic() + backoff_seconds
+            logging.info(
+                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
+                backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
+            )
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed

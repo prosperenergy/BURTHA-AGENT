@@ -712,6 +712,16 @@ def _commit_staged_replacements(staged) -> None:
                 pass
 
 
+def _print_update_completion(message: str) -> None:
+    """Print an update outcome plus, when the dashboard launched this run
+    with an action id, a terminal receipt line the Desktop can match after
+    the dashboard restarts (see #47359 / #58764)."""
+    print(message)
+    action_id = os.environ.get("HERMES_ACTION_ID", "")
+    if len(action_id) == 32 and all(char in "0123456789abcdef" for char in action_id):
+        print(f"=== hermes-update completed {action_id} ===")
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -1059,7 +1069,7 @@ def _update_via_zip(args):
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
     else:
-        print("✓ Update complete!")
+        _print_update_completion("✓ Update complete!")
     try:
         _print_curator_first_run_notice()
     except Exception as e:
@@ -2089,7 +2099,7 @@ def _update_node_dependencies() -> list[str]:
         print("    deps). Fix npm and re-run `hermes update`.")
         return list(labels)
 
-    extra_args = ["--no-fund", "--no-audit", "--progress=false"]
+    extra_args = ["--no-fund", "--no-audit", "--prefer-offline", "--progress=false"]
 
     from hermes_constants import with_hermes_node_path
 
@@ -3916,11 +3926,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
+                    _print_update_completion("✓ Update complete!")
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
-                print("✓ Already up to date!")
+                _print_update_completion("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -4591,7 +4602,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         else:
-            print("✓ Update complete!")
+            _print_update_completion("✓ Update complete!")
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -4863,37 +4874,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _manage_cmd_cache[scope_] = cmd
                 return cmd
 
-            # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
-            # for up to ``agent.restart_drain_timeout`` (default 60s) before
-            # exiting with code 75; we wait slightly longer so the drain
-            # completes before we fall back to a hard restart.  On older
-            # systemd units without SIGUSR1 wiring this wait just times out
-            # and we fall back to ``systemctl restart`` (the old behaviour).
+            # Wait budget for graceful SIGUSR1 restarts.  In-band restart
+            # may defer stop() until active turns finish
+            # (``restart_after_turn_timeout``, #77184) and then spend up to
+            # ``restart_drain_timeout`` inside stop(). Cover both phases so
+            # we don't fall back to a hard kill while the gateway is still
+            # patiently waiting for the requesting turn. On older systemd
+            # units without SIGUSR1 wiring this wait just times out and we
+            # fall back to ``systemctl restart`` (the old behaviour).
             try:
-                from hermes_constants import (
-                    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT as _DEFAULT_DRAIN,
-                )
-            except Exception:
-                _DEFAULT_DRAIN = 60.0
-            _cfg_drain = None
-            try:
-                from hermes_cli.config import load_config
+                from hermes_cli.gateway import _get_restart_exit_wait_budget
 
-                _cfg_agent = load_config().get("agent") or {}
-                _cfg_drain = _cfg_agent.get("restart_drain_timeout")
+                _drain_budget = max(float(_get_restart_exit_wait_budget()), 45.0)
             except Exception:
-                pass
-            try:
-                _drain_budget = (
-                    float(_cfg_drain)
-                    if _cfg_drain is not None
-                    else float(_DEFAULT_DRAIN)
-                )
-            except (TypeError, ValueError):
-                _drain_budget = float(_DEFAULT_DRAIN)
-            # Add a 15s margin so the drain loop + final exit finish before
-            # we escalate to ``systemctl restart`` / SIGTERM.
-            _drain_budget = max(_drain_budget, 30.0) + 15.0
+                _drain_budget = 45.0
 
             restarted_services = []
             failed_or_stale_units = []

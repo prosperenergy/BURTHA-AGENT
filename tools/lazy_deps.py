@@ -287,6 +287,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
     "tool.vision": ("Pillow==12.3.0",),
+    # Document-to-Markdown extraction for read_file (firecrawl-anydoc, Rust
+    # core, imports as `anydoc`). Widens read_file's auto-extraction beyond
+    # the stdlib .ipynb/.docx/.xlsx to PDF, legacy Office (.doc/.ppt/.xls),
+    # OpenDocument, RTF, and EPUB. Installed on first read of such a file;
+    # the call site uses prompt=False so read_file never blocks on a prompt.
+    # NOTE: lazy-only for now — no pyproject `doc-extract` extra until the
+    # package clears the uv exclude-newer 14-day quarantine (first release
+    # 2026-08-04); add the mirrored extra then.
+    "tool.doc_extract": ("firecrawl-anydoc==0.1.6",),
     # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
     # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
     # extras in pyproject.toml. The one-liner installer pulls this in via
@@ -846,6 +855,35 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     unsupported = _unsupported_feature_reason(feature)
     if unsupported:
         raise FeatureUnavailable(feature, missing, unsupported)
+
+    # Package-manager installs (NixOS, and any other distro that ships Hermes
+    # from a read-only store) cannot receive lazy pip installs: the venv's
+    # site-packages lives in the store, so the uv -> pip -> ensurepip ladder
+    # below burns ~15s bootstrapping ensurepip only to fail on a read-only
+    # target. Fail fast with an actionable message instead.
+    #
+    # Skipped when a durable install target is configured: the container
+    # deployment sets HERMES_MANAGED=true *and* HERMES_LAZY_INSTALL_TARGET
+    # (a writable volume), where lazy installs legitimately work.
+    #
+    # The reason string starts with "unsupported " on purpose:
+    # refresh_active_features classifies FeatureUnavailable by that prefix and
+    # reports anything else as a hard failure rather than a skip.
+    if _lazy_install_target() is None:
+        try:
+            from hermes_cli.config import get_managed_system
+
+            managed_by = get_managed_system()
+        except Exception:
+            managed_by = ""  # config unreadable — proceed with the install
+        if managed_by:
+            raise FeatureUnavailable(
+                feature, missing,
+                f"unsupported on {managed_by}-managed installs: this build's "
+                f"packages come from {managed_by}, so Hermes cannot install "
+                f"them at runtime. Add the dependencies for {feature!r} via "
+                f"{managed_by} (or run a pip/uv install of Hermes instead)."
+            )
 
     # Validate every spec against the allowlist + safety regex. Belt and
     # braces — the keys-in-LAZY_DEPS check above already constrains this.

@@ -1013,16 +1013,9 @@ def _has_any_provider_configured() -> bool:
         except Exception:
             pass
 
-    # Check provider-specific auth fallbacks (for example, Copilot via gh auth).
-    try:
-        for provider_id, pconfig in PROVIDER_REGISTRY.items():
-            if pconfig.auth_type != "api_key":
-                continue
-            status = get_auth_status(provider_id)
-            if status.get("logged_in"):
-                return True
-    except Exception:
-        pass
+    # Cheap local checks first: auth.json and config.yaml are on-disk lookups,
+    # while the PROVIDER_REGISTRY sweep below spawns subprocesses (gh) and can
+    # take 15-20s — long enough that desktop setup.status calls time out.
 
     # Check for Nous Portal OAuth credentials
     auth_file = get_hermes_home() / "auth.json"
@@ -1049,6 +1042,17 @@ def _has_any_provider_configured() -> bool:
         cfg_api_key = (model_cfg.get("api_key") or "").strip()
         if cfg_provider or cfg_base_url or cfg_api_key:
             return True
+
+    # Check provider-specific auth fallbacks (for example, Copilot via gh auth).
+    try:
+        for provider_id, pconfig in PROVIDER_REGISTRY.items():
+            if pconfig.auth_type != "api_key":
+                continue
+            status = get_auth_status(provider_id)
+            if status.get("logged_in"):
+                return True
+    except Exception:
+        pass
 
     # Check for Claude Code OAuth credentials (~/.claude/.credentials.json)
     # Only count these if Hermes has been explicitly configured — Claude Code
@@ -5067,6 +5071,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _print_curator_recent_run_notice,
     _print_fts_optimize_available_notice,
     _print_stash_cleanup_guidance,
+    _print_update_completion,
     _record_npm_lockfile_hash,
     _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies,
@@ -5710,7 +5715,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         return _run_npm_install_deterministic(
             npm,
             npm_cwd,
-            extra_args=(*npm_workspace_args, "--silent") if silent else npm_workspace_args,
+            extra_args=(*npm_workspace_args, "--silent", "--prefer-offline") if silent else (*npm_workspace_args, "--prefer-offline"),
             env=build_env,
         )
 
@@ -6872,6 +6877,9 @@ def _desktop_linux_needs_no_sandbox() -> bool:
     unprivileged desktop user on an AppArmor-restricted host. The root case
     should remain an explicit user choice.
     """
+    if os.environ.get("ELECTRON_DISABLE_SANDBOX", 0) == "1":
+        return True
+
     if sys.platform != "linux":
         return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -6970,6 +6978,25 @@ def _desktop_launch_options() -> tuple[list[str], str]:
         else:
             disable_gpu = "auto"
     return flags, disable_gpu
+
+
+def _register_linux_desktop_entry() -> None:
+    """Install the XDG desktop entry for Hermes Desktop (Linux only, best-effort).
+
+    Gives the Electron app a launcher presence: a menu item and an icon.
+    ``Exec`` and ``Icon`` are absolute, so the entry works outside a login
+    shell. ``hermes uninstall --gui`` removes it.
+    """
+    try:
+        from hermes_cli.linux_desktop_entry import install_desktop_entry, is_supported
+
+        if not is_supported():
+            return
+        entry = install_desktop_entry(PROJECT_ROOT)
+        if entry:
+            print(f"✓ Desktop launcher entry installed: {entry}")
+    except Exception as exc:  # never block a launch on launcher plumbing
+        print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
 def cmd_gui(args: argparse.Namespace):
@@ -7172,6 +7199,11 @@ def cmd_gui(args: argparse.Namespace):
 
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
+
+    # Linux: register the app in the desktop launcher, so Hermes shows up
+    # in the application menu with its icon. Best-effort and idempotent.
+    # A failure must never stop the app from launching.
+    _register_linux_desktop_entry()
 
     # --build-only: produce the artifact but do NOT launch. The installer's
     # --update flow drives the rebuild headlessly and then launches the desktop
@@ -12157,6 +12189,33 @@ def main():
     sessions_subparsers.add_parser(
         "optimize",
         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",
+    )
+
+    sessions_clean_markers = sessions_subparsers.add_parser(
+        "clean-markers",
+        help="Permanently clear stale tool-call marker content left by sessions from before #78148",
+        description=(
+            "Before the #78148 fix, a local tool-call template could persist a "
+            "bare bracketed marker (e.g. \"[memory]\") as an assistant turn's "
+            "content instead of real text. This is already repaired in memory "
+            "on every session load, so running this is optional — it rewrites "
+            "the affected rows once, in place, so long-lived sessions stop "
+            "re-scanning/re-repairing the same rows on every resume. Only the "
+            "content column is touched; tool_calls and every other column on "
+            "the row are left untouched."
+        ),
+    )
+    sessions_clean_markers.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Report the affected row count without writing",
+    )
+    sessions_clean_markers.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="Skip the timestamped state.db backup taken before writing (not recommended)",
     )
 
     sessions_optimize_storage = sessions_subparsers.add_parser(

@@ -35,21 +35,23 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
-        # Graceful drain timeout for gateway stop/restart (seconds).
-        # The gateway stops accepting new work, waits for running agents
-        # to finish, then interrupts any remaining runs after the timeout.
-        # 0 = no drain, interrupt immediately (the default).
+        # Force-interrupt budget once gateway stop()/drain has begun
+        # (seconds). Applies to SIGTERM/external stop and to the final
+        # phase of in-band restart after any after-turn wait. 0 = interrupt
+        # immediately (the default).
         #
-        # Contract: if you restart the gateway, in-flight work stops. We do
-        # not hold the restart open for a grace window — a drain timeout
-        # large enough to "save" a long agent turn would have to outlast an
-        # unbounded task (some runs take days), which is impossible, and a
-        # drain timeout shorter than systemd's TimeoutStopSec invites a
-        # SIGKILL-mid-cleanup race that leaves a stale lock and crash-loops
-        # the service. 0 sidesteps both: interrupt now, clean up, exit fast.
-        # Set a positive value in config.yaml only if you explicitly want a
-        # grace window on /restart (and keep it well under TimeoutStopSec).
+        # Keep this short and under systemd TimeoutStopSec — a long value
+        # here invites SIGKILL-mid-cleanup. For in-band restart
+        # (/restart, SIGUSR1), prefer restart_after_turn_timeout below so
+        # active turns finish *before* stop() begins (#77184).
         "restart_drain_timeout": 0,
+        # In-band restart wait for active turns to finish before stop()
+        # (seconds). /restart and SIGUSR1 refuse new work, then wait up to
+        # this cap for in-flight agents/cron/api runs to complete naturally
+        # so the requesting turn is not amputated by restart_drain_timeout.
+        # 0 = legacy behaviour (enter stop()/drain immediately). Default
+        # 6h is a safety valve for wedged agents, not a target latency.
+        "restart_after_turn_timeout": 21600,
         # Upper bound (seconds) a submitted prompt waits for the deferred
         # agent build (MCP discovery, model metadata, skills scan) before
         # failing with a visible error (#63078). The gateway's wait is
@@ -608,10 +610,10 @@ DEFAULT_CONFIG = {
                                       # itself be re-summarized.
         "proactive_prune_min_reclaim_tokens": 4096,  # a proactive prune only commits
                                       # when it reclaims at least this many tokens
-                                      # (measured on the pruned output). Keeps
-                                      # prompt-cache invalidation amortized: one big
-                                      # episodic break instead of a tiny break every
-                                      # tool iteration. 0 = commit any non-zero prune.
+                                      # (measured on the pruned output), then waits
+                                      # for a full trigger-sized token runway to
+                                      # regrow before rearming. Keeps prompt-cache
+                                      # breaks episodic. 0 = no minimum-savings gate.
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead
@@ -1575,6 +1577,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
         "input_device": None,          # PortAudio input device index/name; null uses the process default
+        "capture": "auto",            # auto | local | client — where PCM is captured (client = desktop streams mic via wake.feed)
         "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
         "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
         "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
@@ -2368,7 +2371,7 @@ DEFAULT_CONFIG = {
             "listing": "auto",
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
-            "listing_max_tokens": 20000,
+            "listing_max_tokens": 4000,
         },
     },
 
@@ -3326,6 +3329,22 @@ OPTIONAL_ENV_VARS = {
     "GMI_BASE_URL": {
         "description": "GMI Cloud base URL override",
         "prompt": "GMI Cloud base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_API_KEY": {
+        "description": "Actual Computer inference key (ac_...)",
+        "prompt": "Actual Computer inference key",
+        "url": "https://actual.inc/user/keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_BASE_URL": {
+        "description": "Actual Computer base URL override (set to http://127.0.0.1:8080 for the local offline daemon)",
+        "prompt": "Actual Computer base URL (leave empty for hosted relay)",
         "url": None,
         "password": False,
         "category": "provider",

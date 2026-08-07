@@ -1258,6 +1258,14 @@ class SessionStore:
         try:
             from hermes_state import SessionDB
             self._db = SessionDB()
+        except RuntimeError as e:
+            if "live-system guard" in str(e):
+                # Test-isolation guard fired: a pytest-context process
+                # resolved the developer's production state.db. Never
+                # swallow this into the JSONL fallback — the whole point
+                # is a loud, hard failure.
+                raise
+            print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
@@ -2279,7 +2287,7 @@ class SessionStore:
         """
         if self._db:
             try:
-                return self._db.session_count() > 1
+                return self._db.session_count_ge(2)
             except Exception:
                 pass  # fall through to heuristic
         # Fallback: check if sessions.json was loaded with existing data.

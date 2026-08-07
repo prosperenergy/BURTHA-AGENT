@@ -7334,6 +7334,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
+    def _restore_session_yolo(self, session_meta: dict, *, quiet: bool = False) -> None:
+        """Re-enable YOLO bypass on resume when the session had it on.
+
+        Companion to ``_restore_session_cwd`` — called from every resume path
+        (startup ``--resume``/``-c`` and mid-chat ``/resume``). The persisted
+        flag lives in the session row's ``model_config.yolo_mode`` (written by
+        ``/yolo`` toggles and ``--yolo`` launches); without this restore the
+        in-memory ``tools.approval._session_yolo`` set starts empty in a fresh
+        process and the user's bypass silently reverts.
+
+        No-op when the flag is absent/false, when YOLO is already active for
+        this session (idempotent across repeated resume paths), or when the
+        process was itself launched with ``--yolo`` (frozen bypass already
+        covers everything).
+        """
+        try:
+            from hermes_state import SessionDB
+            from tools.approval import (
+                _YOLO_MODE_FROZEN,
+                enable_session_yolo,
+                is_session_yolo_enabled,
+            )
+        except Exception:
+            return
+        if _YOLO_MODE_FROZEN:
+            return
+        if not SessionDB.session_yolo_enabled(session_meta):
+            return
+        session_key = self.session_id or "default"
+        if is_session_yolo_enabled(session_key):
+            return
+        enable_session_yolo(session_key)
+        msg = "⚡ YOLO mode restored from session — all commands auto-approved. /yolo to turn off."
+        if quiet:
+            print(msg, file=sys.stderr)
+        else:
+            self._console_print(f"[dim]{_escape(msg)}[/dim]")
+
 
 
     def _render_resume_history_panel_lines(self, panel) -> list[str]:
@@ -10211,6 +10249,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_rollback_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
+        elif canonical == "export":
+            self._handle_export_command(cmd_original)
+        elif canonical == "import":
+            self._handle_import_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "agents":
@@ -10258,6 +10300,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "heartbeat":
+            self._handle_heartbeat_command(cmd_original)
+        elif canonical == "refine":
+            self._handle_refine_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a
@@ -10535,6 +10581,72 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         self._goal_manager = mgr
         return mgr
+
+    def _get_heartbeat_manager(self):
+        """Return the HeartbeatManager bound to the current session_id.
+
+        Cached on ``self._heartbeat_manager`` and rebound lazily when
+        ``session_id`` changes (mirrors ``_get_goal_manager``).
+        """
+        try:
+            from hermes_cli.heartbeat import HeartbeatManager
+        except Exception as exc:
+            logging.debug("heartbeat manager unavailable: %s", exc)
+            return None
+
+        sid = getattr(self, "session_id", None) or ""
+        if not sid:
+            return None
+
+        existing = getattr(self, "_heartbeat_manager", None)
+        if existing is not None and getattr(existing, "session_id", None) == sid:
+            return existing
+
+        mgr = HeartbeatManager(session_id=sid)
+        self._heartbeat_manager = mgr
+        return mgr
+
+    def _start_heartbeat_watchdog(self):
+        """Start the idle-poll thread that fires due heartbeats.
+
+        Same pattern as the wake-word watchdog: a daemon thread polls a few
+        times a minute; when the session is idle (no agent running, empty
+        input queue) and the heartbeat is due, its prompt is injected into
+        ``_pending_input`` as a normal user turn. Missed ticks coalesce —
+        the anchor resets on fire, so a busy hour yields ONE heartbeat turn,
+        not a backlog. Idempotent; safe to call on every /heartbeat set.
+        """
+        if getattr(self, "_heartbeat_watchdog_started", False):
+            return
+        self._heartbeat_watchdog_started = True
+
+        from hermes_cli.heartbeat import POLL_SECONDS
+
+        def _loop():
+            try:
+                while not getattr(self, "_should_exit", False):
+                    time.sleep(POLL_SECONDS)
+                    try:
+                        mgr = self._get_heartbeat_manager()
+                        if mgr is None or not mgr.is_active():
+                            continue
+                        busy = (
+                            self._agent_running
+                            or getattr(self, "_voice_recording", False)
+                            or getattr(self, "_voice_processing", False)
+                            or not self._pending_input.empty()
+                        )
+                        if busy:
+                            continue
+                        prompt = mgr.due_prompt()
+                        if prompt:
+                            self._pending_input.put(prompt)
+                    except Exception as exc:
+                        logging.debug("heartbeat watchdog tick failed: %s", exc)
+            finally:
+                self._heartbeat_watchdog_started = False
+
+        threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
 
 
 
@@ -10820,6 +10932,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if is_session_yolo_enabled(old_session_id):
             enable_session_yolo(new_session_id)
             disable_session_yolo(old_session_id)
+            # Carry the persisted flag onto the continuation row so a later
+            # `hermes --resume <new_id>` restores the bypass too. getattr
+            # guard: tests call this unbound against a minimal stand-in.
+            _persist = getattr(self, "_persist_session_yolo", None)
+            if _persist:
+                _persist(new_session_id, True)
 
     def _is_session_yolo_active(self) -> bool:
         """Whether YOLO bypass is currently enabled for this CLI session.
@@ -10871,18 +10989,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
 
         session_key = self.session_id or "default"
+        # ``getattr`` guard: tests exercise this method unbound against a
+        # minimal stand-in object (see tests/cli/test_cli_yolo_toggle.py);
+        # persistence is best-effort either way.
+        _persist = getattr(self, "_persist_session_yolo", None)
         if is_session_yolo_enabled(session_key):
             disable_session_yolo(session_key)
+            if _persist:
+                _persist(session_key, False)
             _cprint(
                 f"  ⚠ YOLO mode {_Colors.BOLD}{_Colors.RED}OFF{_Colors.RESET}"
                 " — dangerous commands will require approval."
             )
         else:
             enable_session_yolo(session_key)
+            if _persist:
+                _persist(session_key, True)
             _cprint(
                 f"  ⚡ YOLO mode {_Colors.BOLD}{_Colors.GREEN}ON{_Colors.RESET}"
                 " — all commands auto-approved. Use with caution."
             )
+
+    def _persist_session_yolo(self, session_key: str, enabled: bool) -> None:
+        """Persist the YOLO flag to the session row so --resume restores it.
+
+        Best-effort: the in-memory toggle is authoritative for this process;
+        persistence only affects a future ``hermes --resume``. Skipped when the
+        session store is unavailable or the row doesn't exist yet (the row is
+        created lazily on the first turn — ``_toggle_yolo`` before any chat
+        writes nothing, and the launch-time ``--yolo`` flag is carried into the
+        creation-time model_config instead).
+        """
+        db = getattr(self, "_session_db", None)
+        if db is None or not session_key or session_key == "default":
+            return
+        try:
+            db.set_session_yolo(session_key, enabled)
+        except Exception:
+            pass
 
 
 
@@ -13229,7 +13373,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._approval_deadline = 0
             self._paint_now()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-            return "deny"
+            self._persist_prompt_summary(
+                "⚠", "Approval", command, "timed out (no response)",
+            )
+            return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
                           smart_denied: bool = False) -> list[str]:
@@ -13261,6 +13408,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session": "approve_session",
             "always": "always_approve",
             "deny": "deny",
+            "timeout": "timeout",
         }.get(verdict, "deny")
 
     def _handle_approval_selection(self) -> None:
