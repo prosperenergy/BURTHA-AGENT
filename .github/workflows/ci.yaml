@@ -1,5 +1,10 @@
 name: CI
 
+# Path is ``ci.yaml`` (not ``ci.yml``) so GitHub registers a fresh workflow
+# after the previous ``ci.yml`` orchestrator was disabled_manually. Keep the
+# display name ``CI`` so publish-e2e-evidence and branch-protection references
+# continue to match.
+#
 # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
 # calls the sub-workflows that a PR can actually affect. A final
 # ``all-checks-pass`` gate job aggregates results so branch protection only

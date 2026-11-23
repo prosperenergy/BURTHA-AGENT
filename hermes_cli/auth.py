@@ -152,6 +152,7 @@ SERVICE_PROVIDER_NAMES: Dict[str, str] = {
 # provider as configured. This sentinel is sent only to LM Studio, never to
 # any remote service.
 LMSTUDIO_NOAUTH_PLACEHOLDER = "dummy-lm-api-key"
+BURTHA_NOAUTH_PLACEHOLDER = "burtha-local-noauth"
 ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 
 
@@ -2126,11 +2127,15 @@ def resolve_provider(
             continue
         # GitHub tokens are commonly present for repo/tool access but should not
         # hijack inference auto-selection unless the user explicitly chooses
-        # Copilot/GitHub Models as the provider. LM Studio is a local server
-        # whose availability isn't implied by LM_API_KEY presence (it may be
-        # offline, and the no-auth setup uses a placeholder value), so it
-        # also requires explicit selection.
-        if pid in {"copilot", "lmstudio"}:
+        # Copilot/GitHub Models as the provider. LM Studio / Burtha local (exo)
+        # are local servers whose availability isn't implied by key presence
+        # (they may be offline, and the no-auth setup uses a placeholder
+        # value), so they also require explicit selection.
+        if pid in {"copilot", "lmstudio", "exo"} or pconfig.id in {
+            "copilot",
+            "lmstudio",
+            "exo",
+        }:
             continue
         for env_var in pconfig.api_key_env_vars:
             if has_usable_secret(os.getenv(env_var, "")):
@@ -7165,10 +7170,22 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     if not api_key and provider_id == "lmstudio":
         api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
         key_source = key_source or "default"
+    # Same pattern for Burtha local (EXO replacement) — local loopback needs
+    # no real key; Mac EXO users can still set BURTHA_API_KEY / EXO_API_KEY.
+    # Match on pconfig.id so aliases (burtha-local, prosper-exo, …) behave
+    # the same as the canonical "exo" provider id.
+    _is_burtha_local = provider_id == "exo" or pconfig.id == "exo"
+    if not api_key and _is_burtha_local:
+        api_key = BURTHA_NOAUTH_PLACEHOLDER
+        key_source = key_source or "default"
 
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+    # Legacy EXO_BASE_URL still wins when BURTHA_BASE_URL is unset so Mac
+    # Prosper EXO clusters keep working without a config rewrite.
+    if _is_burtha_local and not env_url:
+        env_url = os.getenv("EXO_BASE_URL", "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)

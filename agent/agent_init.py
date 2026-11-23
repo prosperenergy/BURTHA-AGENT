@@ -2525,12 +2525,13 @@ def init_agent(
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)
-    # Local EXO and LM Studio runners can truthfully report a smaller context
-    # window than the global hosted-model floor.  Keep this opt-in: only an
-    # explicit positive model.context_length allows the local route through.
+    # Local Burtha/EXO and LM Studio runners can truthfully report a smaller
+    # context window than the global hosted-model floor.  Keep this opt-in:
+    # only an explicit positive model.context_length allows the local route
+    # through. ``exo`` remains the provider id (aliases: burtha-local, …).
     _allow_explicit_local_below_floor = (
         str(getattr(agent, "provider", "") or "").strip().lower()
-        in {"exo", "lmstudio"}
+        in {"exo", "lmstudio", "burtha", "burtha-local", "local-burtha", "prosper-exo"}
         and isinstance(agent._config_context_length, int)
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0

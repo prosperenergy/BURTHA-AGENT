@@ -635,7 +635,7 @@ def main() -> int:
             print("PR_NUMBER is required", file=sys.stderr)
             return 1
 
-    # Build commit info line from env vars (set by ci.yml).
+    # Build commit info line from env vars (set by ci.yaml).
     commit_sha = os.environ.get("COMMIT_SHA", "")
     commit_msg = os.environ.get("COMMIT_MESSAGE", "")
     commit_url = os.environ.get("COMMIT_URL", "")
