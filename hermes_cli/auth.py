@@ -152,6 +152,7 @@ SERVICE_PROVIDER_NAMES: Dict[str, str] = {
 # provider as configured. This sentinel is sent only to LM Studio, never to
 # any remote service.
 LMSTUDIO_NOAUTH_PLACEHOLDER = "dummy-lm-api-key"
+BURTHA_NOAUTH_PLACEHOLDER = "burtha-local-noauth"
 ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 
 
@@ -7165,10 +7166,19 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     if not api_key and provider_id == "lmstudio":
         api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
         key_source = key_source or "default"
+    # Same pattern for Burtha local (EXO replacement) — local loopback needs
+    # no real key; Mac EXO users can still set BURTHA_API_KEY / EXO_API_KEY.
+    if not api_key and provider_id == "exo":
+        api_key = BURTHA_NOAUTH_PLACEHOLDER
+        key_source = key_source or "default"
 
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+    # Legacy EXO_BASE_URL still wins when BURTHA_BASE_URL is unset so Mac
+    # Prosper EXO clusters keep working without a config rewrite.
+    if provider_id == "exo" and not env_url:
+        env_url = os.getenv("EXO_BASE_URL", "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)

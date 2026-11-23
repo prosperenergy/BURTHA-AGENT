@@ -91,9 +91,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     "exo": HermesOverlay(
         transport="openai_chat",
         auth_type="api_key",
-        extra_env_vars=("EXO_API_KEY",),
-        base_url_override="http://127.0.0.1:52415/v1",
-        base_url_env_var="EXO_BASE_URL",
+        # Burtha local LLM (python -m hermes_cli.burtha_local_llm). Legacy
+        # EXO_* env vars remain accepted as aliases via the provider profile.
+        extra_env_vars=("BURTHA_API_KEY", "EXO_API_KEY"),
+        base_url_override="http://127.0.0.1:18765/v1",
+        base_url_env_var="BURTHA_BASE_URL",
     ),
     "copilot-acp": HermesOverlay(
         transport="codex_responses",

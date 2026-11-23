@@ -1,5 +1,5 @@
 name: exo-provider
 kind: model-provider
-version: 1.0.0
-description: Prosper EXO local OpenAI-compatible endpoint
+version: 1.1.0
+description: Burtha local OpenAI-compatible endpoint (EXO replacement)
 author: Prosper Energy
