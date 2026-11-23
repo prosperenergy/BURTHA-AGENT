@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -15,32 +17,41 @@ sys.modules["emit_review_status"] = _mod
 _spec.loader.exec_module(_mod)
 
 
+def _diff_anchor(path: str) -> str:
+    """GitHub compare-page fragment for a path (sha256 hex of the path)."""
+    return f"diff-{hashlib.sha256(path.encode()).hexdigest()}"
+
+
 def test_ci_review_status_links_to_each_sensitive_file_change():
+    files = [".github/workflows/ci.yaml", "apps/desktop/eslint.config.mjs"]
     results = _mod.build_results(
         ci_review=True,
         mcp_catalog=False,
         supply_chain=False,
         label_present=False,
-        ci_review_files='[".github/workflows/ci.yml", "apps/desktop/eslint.config.mjs"]',
+        ci_review_files=json.dumps(files),
         repo_url="https://github.com/nousresearch/hermes-agent",
         base_sha="base456",
         head_sha="abc123",
     )
 
-    assert results[0]["detail"] == (
-        "**Sensitive files changed:**\n"
-        "- [`.github/workflows/ci.yml`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03f)\n"
-        "- [`apps/desktop/eslint.config.mjs`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-a45471520795db6e46840d1ba2a82c1f8a2841039bd60fb50624488c5f192438)"
-    )
+    expected_lines = ["**Sensitive files changed:**"]
+    for path in files:
+        expected_lines.append(
+            f"- [`{path}`](https://github.com/nousresearch/hermes-agent/"
+            f"compare/base456...abc123#{_diff_anchor(path)})"
+        )
+    assert results[0]["detail"] == "\n".join(expected_lines)
 
 
 def test_approved_ci_review_is_visible_info():
+    path = ".github/workflows/ci.yaml"
     results = _mod.build_results(
         ci_review=True,
         mcp_catalog=False,
         supply_chain=False,
         label_present=True,
-        ci_review_files='[".github/workflows/ci.yml"]',
+        ci_review_files=f'["{path}"]',
         repo_url="https://github.com/nousresearch/hermes-agent",
         base_sha="base456",
         head_sha="abc123",
@@ -55,6 +66,7 @@ def test_approved_ci_review_is_visible_info():
         ),
         "detail": (
             "**Sensitive files changed:**\n"
-            "- [`.github/workflows/ci.yml`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03f)"
+            f"- [`{path}`](https://github.com/nousresearch/hermes-agent/"
+            f"compare/base456...abc123#{_diff_anchor(path)})"
         ),
     }]

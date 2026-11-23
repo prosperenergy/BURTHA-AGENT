@@ -166,10 +166,10 @@ def test_classify(files, expected):
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
     assert ci_review_files([
         "apps/desktop/src/app.tsx",
-        ".github/workflows/ci.yml",
+        ".github/workflows/ci.yaml",
         "apps/desktop/eslint.config.mjs",
-        ".github/workflows/ci.yml",
+        ".github/workflows/ci.yaml",
     ]) == [
-        ".github/workflows/ci.yml",
+        ".github/workflows/ci.yaml",
         "apps/desktop/eslint.config.mjs",
     ]
