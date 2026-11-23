@@ -2337,6 +2337,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
+        # Local no-auth endpoints (LM Studio / Burtha-local/exo) and ambient
+        # Copilot tokens must not win the auto aux chain — they require
+        # explicit model.provider selection (see hermes_cli.auth auto-detect).
+        if getattr(pconfig, "id", provider_id) in {"lmstudio", "exo", "copilot"}:
+            continue
         if provider_id == "anthropic":
             # Only try anthropic when the user has explicitly configured it.
             # Without this gate, Claude Code credentials get silently used

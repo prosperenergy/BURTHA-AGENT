@@ -87,3 +87,27 @@ def test_burtha_credentials_accept_legacy_exo_base_url(monkeypatch):
     creds = resolve_api_key_provider_credentials("exo")
     assert creds["base_url"] == "http://127.0.0.1:52415/v1"
     assert creds["api_key"] == BURTHA_NOAUTH_PLACEHOLDER
+
+
+def test_burtha_local_does_not_hijack_auto_auxiliary(monkeypatch):
+    """No-auth Burtha/EXO must not win the auto aux chain (like LM Studio)."""
+    from unittest.mock import patch
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("BURTHA_API_KEY", raising=False)
+    monkeypatch.delenv("BURTHA_BASE_URL", raising=False)
+    monkeypatch.delenv("EXO_API_KEY", raising=False)
+    monkeypatch.delenv("EXO_BASE_URL", raising=False)
+
+    from agent.auxiliary_client import get_text_auxiliary_client
+
+    with patch("agent.auxiliary_client._read_nous_auth", return_value=None), patch(
+        "agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"
+    ), patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        client, model = get_text_auxiliary_client()
+
+    assert client is None
+    assert model is None
+    mock_openai.assert_not_called()
